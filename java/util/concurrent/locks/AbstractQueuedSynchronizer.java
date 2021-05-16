@@ -701,16 +701,23 @@ public abstract class AbstractQueuedSynchronizer
 
     /**
      * Inserts node into queue, initializing if necessary. See picture above.
+     * 将节点入队，如有必要，先行初始化。查看上述图片。
      * @param node the node to insert
      * @return node's predecessor
      */
     private Node enq(final Node node) {
+        // 自旋
         for (;;) {
             Node t = tail;
             if (t == null) { // Must initialize
+                // 若未初始化 CLH 队列，先初始化。
+                // CAS保证即使并发执行，也只有一个线程能成功，无论成功与否，本轮循环结束，进入下一循环。
                 if (compareAndSetHead(new Node()))
                     tail = head;
             } else {
+                // 将节点插入队尾
+                // 因可能存在并发执行，在尾节点成功修改前无法保证t.next挂到的node已成功入队，只有成功修改尾节点后，才能保证队列的正确性。
+                // CAS 保证操作的原子性，自旋保证可靠性，循环插入队尾操作直到成功方才返回。
                 node.prev = t;
                 if (compareAndSetTail(t, node)) {
                     t.next = node;
@@ -722,6 +729,7 @@ public abstract class AbstractQueuedSynchronizer
 
     /**
      * Creates and enqueues node for current thread and given mode.
+     * 为当前线程及给定模式创建节点并入队。
      *
      * @param mode Node.EXCLUSIVE for exclusive, Node.SHARED for shared
      * @return the new node
@@ -729,10 +737,12 @@ public abstract class AbstractQueuedSynchronizer
     private Node addWaiter(Node mode) {
         Node node = new Node(Thread.currentThread(), mode);
         // Try the fast path of enq; backup to full enq on failure
+        // 尝试以enq的捷径快速插入队尾，若失败，执行完整enq
         Node pred = tail;
         if (pred != null) {
             node.prev = pred;
             if (compareAndSetTail(pred, node)) {
+                // CAS成功之后可保证无条件写入next不会出现竞争
                 pred.next = node;
                 return node;
             }
@@ -756,6 +766,7 @@ public abstract class AbstractQueuedSynchronizer
 
     /**
      * Wakes up node's successor, if one exists.
+     * 唤醒后继节点，如果存在。
      *
      * @param node the node
      */
@@ -764,6 +775,8 @@ public abstract class AbstractQueuedSynchronizer
          * If status is negative (i.e., possibly needing signal) try
          * to clear in anticipation of signalling.  It is OK if this
          * fails or if status is changed by waiting thread.
+         * 如果状态是负的，尝试清除释放信号。
+         * 如果操作失败或者状态被等待队列中线程修改也没关系。
          */
         int ws = node.waitStatus;
         if (ws < 0)
@@ -774,6 +787,8 @@ public abstract class AbstractQueuedSynchronizer
          * just the next node.  But if cancelled or apparently null,
          * traverse backwards from tail to find the actual
          * non-cancelled successor.
+         * 被唤醒的线程在后继节点中，一般来说就是下一个。
+         * 但如果下一个节点被取消或者为null，从尾节点向前遍历获取有效的未取消后继节点。
          */
         Node s = node.next;
         if (s == null || s.waitStatus > 0) {
@@ -860,17 +875,20 @@ public abstract class AbstractQueuedSynchronizer
 
     /**
      * Cancels an ongoing attempt to acquire.
+     * 取消正在进行的获取资源尝试。
      *
      * @param node the node
      */
     private void cancelAcquire(Node node) {
         // Ignore if node doesn't exist
+        // 如果节点不存在，忽略它。
         if (node == null)
             return;
 
         node.thread = null;
 
         // Skip cancelled predecessors
+        // 跳过已取消的前置节点。
         Node pred = node.prev;
         while (pred.waitStatus > 0)
             node.prev = pred = pred.prev;
@@ -878,28 +896,41 @@ public abstract class AbstractQueuedSynchronizer
         // predNext is the apparent node to unsplice. CASes below will
         // fail if not, in which case, we lost race vs another cancel
         // or signal, so no further action is necessary.
+        // predNext 是主要取消拼接的节点
+        // 以下的CAS可能在与其他线程释放或者取消的竞争中失败，这种情况下不用采取进一步措施
         Node predNext = pred.next;
 
         // Can use unconditional write instead of CAS here.
         // After this atomic step, other Nodes can skip past us.
         // Before, we are free of interference from other threads.
+        // 可以以无条件写入代替CAS
+        // 若其他节点的CAS在此之后，其他节点能跳过本节点
+        // 若其他节点的CAS在此之前，本节点不会受其他节点影响
         node.waitStatus = Node.CANCELLED;
 
+        // 以下为尝试性操作，即使失败也没关系，会由其他线程保证队列正确
         // If we are the tail, remove ourselves.
+        // 如果当前节点是尾节点，删除它
+        // 如果与入队节点出现竞争，可能出现两种情况，⑴成功删除尾节点，入队节点此次操作失败，将自旋重新尝试入队，⑵删除失败，那无需取消拼接，而是等待新的尾节点设置唤醒信号时剔除
         if (node == tail && compareAndSetTail(node, pred)) {
             compareAndSetNext(pred, predNext, null);
         } else {
             // If successor needs signal, try to set pred's next-link
             // so it will get one. Otherwise wake it up to propagate.
+            // 如果后继节点需要唤醒，尝试修改前置节点的next连接
+            // 否则直接唤醒它的后继节点
             int ws;
             if (pred != head &&
                 ((ws = pred.waitStatus) == Node.SIGNAL ||
                  (ws <= 0 && compareAndSetWaitStatus(pred, ws, Node.SIGNAL))) &&
                 pred.thread != null) {
                 Node next = node.next;
+                // 前置节点为有效非头节点，尝试将两个节点连接
+                // 可能与后继节点执行shouldParkAfterFailedAcquire剔除前置无效节点时发生竞争
                 if (next != null && next.waitStatus <= 0)
                     compareAndSetNext(pred, predNext, next);
             } else {
+                // ②前置节点为头节点或前置节点已取消，直接唤醒后继节点，唤醒后获取锁或由其自行寻找有效前置节点
                 unparkSuccessor(node);
             }
 
@@ -911,34 +942,51 @@ public abstract class AbstractQueuedSynchronizer
      * Checks and updates status for a node that failed to acquire.
      * Returns true if thread should block. This is the main signal
      * control in all acquire loops.  Requires that pred == node.prev.
+     * 当节点请求资源失败时检查并更新状态。
+     * 如果期望挂起该线程，返回true。
+     * 这是所有请求循环中的主要信号控制。
+     * 需要当前节点的prev指针指向pred节点。（为什么需要传递pred？？？？？）
      *
      * @param pred node's predecessor holding status
      * @param node the node
      * @return {@code true} if thread should block
      */
     private static boolean shouldParkAfterFailedAcquire(Node pred, Node node) {
+        /*
+         * 剔除无效前置节点，并更新前置节点状态，表明等待唤醒。
+         * 在剔除无效前置节点或更新前置节点状态后，可能前置节点已成功获得并释放资源，那么该线程挂起后将立即被唤醒，为优化性能，在挂起前对请求资源进行最后的尝试。
+         * 若节点是由挂起状态被唤醒后，没请求到资源，则前置节点状态必已更新完毕，直接准备再次挂起。
+         */
         int ws = pred.waitStatus;
         if (ws == Node.SIGNAL)
             /*
              * This node has already set status asking a release
              * to signal it, so it can safely park.
+             * 该节点已成功设置一个需要唤醒的标志，可以安全的挂起。
              */
             return true;
         if (ws > 0) {
             /*
              * Predecessor was cancelled. Skip over predecessors and
              * indicate retry.
+             * 前置节点已取消。
+             * 跳过前置节点并重试。
              */
             do {
                 node.prev = pred = pred.prev;
             } while (pred.waitStatus > 0);
+            // 以当前线程为准，其他线程cancel时即使发生竞争，其CAS也会失败
             pred.next = node;
         } else {
             /*
              * waitStatus must be 0 or PROPAGATE.  Indicate that we
              * need a signal, but don't park yet.  Caller will need to
              * retry to make sure it cannot acquire before parking.
+             * waitStatus 必需是 0（默认值） 或 PROPAGATE。
+             * 表明当前线程需要一个唤醒信号，但尚未挂起。
+             * 该线程在挂起前应再次尝试以保证确实不能获得资源。
              */
+            // CAS可能与前置节点cancel时发生竞争导致失败，将以cancel线程为主，无论如何最终通过外层自旋保证CAS的成功，并且自旋回来之后剔除cancel节点并尝试更新下一个有效节点
             compareAndSetWaitStatus(pred, ws, Node.SIGNAL);
         }
         return false;
@@ -953,6 +1001,7 @@ public abstract class AbstractQueuedSynchronizer
 
     /**
      * Convenience method to park and then check if interrupted
+     * 挂起并检查是否中断过
      *
      * @return {@code true} if interrupted
      */
@@ -973,6 +1022,8 @@ public abstract class AbstractQueuedSynchronizer
     /**
      * Acquires in exclusive uninterruptible mode for thread already in
      * queue. Used by condition wait methods as well as acquire.
+     * 由队列中线程以独占不响应中断模式请求资源。
+     * 也由条件等待方法使用。
      *
      * @param node the node
      * @param arg the acquire argument
@@ -982,20 +1033,26 @@ public abstract class AbstractQueuedSynchronizer
         boolean failed = true;
         try {
             boolean interrupted = false;
+            // 线程请求资源失败并成功入队后将挂起⑴，并且可能被唤醒（①前置头节点释放资源，②前置节点被取消，③被其他线程中断），唤醒后重新尝试请求资源⑵，若没有成功获得资源，将再次挂起⑴，循环往复，直到成功请求资源为止
             for (;;) {
                 final Node p = node.predecessor();
+                // ⑵.默认首节点持有资源，且前置节点为首节点的节点有资格请求资源，成功请求资源后跳出自旋返回（非公平情况下可能出现其他线程与次首线程的竞争）
                 if (p == head && tryAcquire(arg)) {
+                    // 成功获取资源，更新首节点为当前节点
                     setHead(node);
+                    // 清空前置节点挂载，等待GC
                     p.next = null; // help GC
                     failed = false;
                     return interrupted;
                 }
+                // ⑴.更新前置节点状态以表明等待唤醒，并进入挂起状态。
                 if (shouldParkAfterFailedAcquire(p, node) &&
                     parkAndCheckInterrupt())
                     interrupted = true;
             }
         } finally {
             if (failed)
+                // 表明获取资源未正常结束，更新节点状态为 CANCELLED，如 tryAcquire 抛出异常，见 ReentrantLock.Sync.nonfairTryAcquire
                 cancelAcquire(node);
         }
     }
@@ -1174,12 +1231,17 @@ public abstract class AbstractQueuedSynchronizer
      * Attempts to acquire in exclusive mode. This method should query
      * if the state of the object permits it to be acquired in the
      * exclusive mode, and if so to acquire it.
+     * 尝试以独占模式请求资源。
+     * 该方法将查询对象状态是否允许以独占模式请求，若是，则请求。
      *
      * <p>This method is always invoked by the thread performing
      * acquire.  If this method reports failure, the acquire method
      * may queue the thread, if it is not already queued, until it is
      * signalled by a release from some other thread. This can be used
      * to implement method {@link Lock#tryLock()}.
+     * 该方法总是由执行线程调用。
+     * 如果方法返回false，并且当前线程没有入队，可将其入队，直到其他线程给它发送释放信号。
+     * 该方法可用于实现 tryLock.
      *
      * <p>The default
      * implementation throws {@link UnsupportedOperationException}.
@@ -1203,8 +1265,10 @@ public abstract class AbstractQueuedSynchronizer
     /**
      * Attempts to set the state to reflect a release in exclusive
      * mode.
+     * 尝试设置一个状态来体现以并发模式释放资源。
      *
      * <p>This method is always invoked by the thread performing release.
+     * 这个方法总是在线程释放资源时被调用。
      *
      * <p>The default implementation throws
      * {@link UnsupportedOperationException}.
@@ -1307,12 +1371,17 @@ public abstract class AbstractQueuedSynchronizer
     }
 
     /**
+     * ===================== AQS.exclusive.acquire ========================>
      * Acquires in exclusive mode, ignoring interrupts.  Implemented
      * by invoking at least once {@link #tryAcquire},
      * returning on success.  Otherwise the thread is queued, possibly
      * repeatedly blocking and unblocking, invoking {@link
      * #tryAcquire} until success.  This method can be used
      * to implement method {@link Lock#lock}.
+     * 以独占模式请求资源，并忽略中断。
+     * 实现方式为调用 tryAcquire 至少一次，并在成功时返回。
+     * 否则线程将入队，并可能在挂起和唤醒间无限循环，直到成功调用tryAcquire。
+     * 该方法可用于实现加锁。
      *
      * @param arg the acquire argument.  This value is conveyed to
      *        {@link #tryAcquire} but is otherwise uninterpreted and
@@ -1321,6 +1390,7 @@ public abstract class AbstractQueuedSynchronizer
     public final void acquire(int arg) {
         if (!tryAcquire(arg) &&
             acquireQueued(addWaiter(Node.EXCLUSIVE), arg))
+            // 不响应中断，补打中断标志
             selfInterrupt();
     }
 
@@ -1372,9 +1442,13 @@ public abstract class AbstractQueuedSynchronizer
     }
 
     /**
+     * ===================AQS.exclusive.release====================>
      * Releases in exclusive mode.  Implemented by unblocking one or
      * more threads if {@link #tryRelease} returns true.
      * This method can be used to implement method {@link Lock#unlock}.
+     * 以独占模式释放资源。
+     * 具体实现为如果tryRelease返回true，唤醒一个或多个线程。
+     * 这个方法可用于实现解锁。
      *
      * @param arg the release argument.  This value is conveyed to
      *        {@link #tryRelease} but is otherwise uninterpreted and
@@ -1385,6 +1459,7 @@ public abstract class AbstractQueuedSynchronizer
         if (tryRelease(arg)) {
             Node h = head;
             if (h != null && h.waitStatus != 0)
+                // ①默认首节点持有资源，释放资源后，唤醒后继节点
                 unparkSuccessor(h);
             return true;
         }
