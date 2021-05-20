@@ -805,6 +805,7 @@ public abstract class AbstractQueuedSynchronizer
      * Release action for shared mode -- signals successor and ensures
      * propagation. (Note: For exclusive mode, release just amounts
      * to calling unparkSuccessor of head if it needs signal.)
+     * 共享模式的释放操作 --- 唤醒后继节点并确保传播。（注：对于独占模式，释放只对头节点调用unparkSuccessor）
      */
     private void doReleaseShared() {
         /*
@@ -817,20 +818,35 @@ public abstract class AbstractQueuedSynchronizer
          * while we are doing this. Also, unlike other uses of
          * unparkSuccessor, we need to know if CAS to reset status
          * fails, if so rechecking.
+         * 确保唤醒可以传播，即使多线程在执行请求与释放操作。
+         * 如需唤醒，正常方式将尝试调用 unparkSuccessor 。
+         * 但如果不是正常方式（多线程同时释放），状态将置为 PROPAGATE 来确保传播将继续。
+         * 除此之外，我们必须循环以防我们进行操作的时候有新节点加入。
+         * 与此同时，不像其他使用 unparkSuccessor 的情况，我们必须知道CAS是否重置状态失败，如果是，那么重新检查。
+         */
+        /*
+         * ※※※※※
+         * 因为是共享模式，所以可能存在多个线程同时释放资源的情况，此时逻辑相较于独占模式将复杂的多，执行先后不同可能导致在不同时间节点的多种结果
+         * 假设有ABC三个线程，AB已成功获取资源，现准备释放资源（可能并发），C位于同步队列头节点之后等待唤醒
+         * A首先释放资源，并唤醒C，B随后释放资源
          */
         for (;;) {
             Node h = head;
             if (h != null && h != tail) {
                 int ws = h.waitStatus;
                 if (ws == Node.SIGNAL) {
+                    // 确保头节点的waitStatus从SIGNAL重置回默认值（0）后才会唤醒后继节点，以便并发释放的情况下竞争失败的线程（B）可以自旋后正确进入下一分支
                     if (!compareAndSetWaitStatus(h, Node.SIGNAL, 0))
                         continue;            // loop to recheck cases
                     unparkSuccessor(h);
                 }
+                // 因B线程也需要唤醒下一节点，但下一节点已被A线程唤醒，若继续唤醒C节点无益，因此将状态置为PROPAGATE，那么C节点在成功获取资源即使剩余资源为0时，依然可以通过读取头节点状态（PROPAGATE）来继续向下传播
                 else if (ws == 0 &&
                          !compareAndSetWaitStatus(h, 0, Node.PROPAGATE))
                     continue;                // loop on failed CAS
             }
+            // 一般在后继节点C成功获取资源并更新头节点后线程B才通过CAS将旧的头节点的waitStatus更新为PROPAGATE时出现if条件不等
+            // 因头节点已被C更新，此时B可直接再次尝试唤醒C的后继节点而不是通过设置waitStatus为PROPAGATE实现传播
             if (h == head)                   // loop if head changed
                 break;
         }
@@ -840,11 +856,14 @@ public abstract class AbstractQueuedSynchronizer
      * Sets head of queue, and checks if successor may be waiting
      * in shared mode, if so propagating if either propagate > 0 or
      * PROPAGATE status was set.
+     * 设置队列头节点，并且检查共享模式下是否有后继节点
+     * 如果有并且propagate > 0或者状态是PROPAGATE则传播唤醒后继节点
      *
      * @param node the node
      * @param propagate the return value from a tryAcquireShared
      */
     private void setHeadAndPropagate(Node node, int propagate) {
+        // 记录上一个头节点，用于进行下面的检查
         Node h = head; // Record old head for check below
         setHead(node);
         /*
@@ -854,14 +873,22 @@ public abstract class AbstractQueuedSynchronizer
          *     or after setHead) by a previous operation
          *     (note: this uses sign-check of waitStatus because
          *      PROPAGATE status may transition to SIGNAL.)
+         * 在以下情况尝试唤醒下一节点：
+         *   调用者指明传播状态（propagate > 0，尚有剩余资源），
+         *   或者由先前操作所标志（因为h.waitStatus在setHead前后都有可能）
+         *  （注：这里使用waitStatus < 0是因为PROPAGATE可能变为SIGNAL(新节点入队，可能导致无效唤醒)）
          * and
          *   The next node is waiting in shared mode,
          *     or we don't know, because it appears null
+         *   下一节点正以共享模式等待（挂起），或者我们不知道（是什么模式），因为它可能是null（node即是尾节点）
          *
          * The conservatism in both of these checks may cause
          * unnecessary wake-ups, but only when there are multiple
          * racing acquires/releases, so most need signals now or soon
          * anyway.
+         * 这两项保守检查可能导致不必要的唤醒，
+         * 但只有存在多线程竞争时（才可能发生），
+         * 所以无论现在还是不久的将来他们都需要被唤醒。
          */
         if (propagate > 0 || h == null || h.waitStatus < 0 ||
             (h = head) == null || h.waitStatus < 0) {
@@ -1294,11 +1321,15 @@ public abstract class AbstractQueuedSynchronizer
      * Attempts to acquire in shared mode. This method should query if
      * the state of the object permits it to be acquired in the shared
      * mode, and if so to acquire it.
+     * 尝试以共享模式请求资源。
+     * 该方法将查询对象状态是否允许以共享模式请求，若是，则请求。
      *
      * <p>This method is always invoked by the thread performing
      * acquire.  If this method reports failure, the acquire method
      * may queue the thread, if it is not already queued, until it is
      * signalled by a release from some other thread.
+     * 该方法总是由执行线程调用。
+     * 如果方法返回false，并且当前线程没有入队，可将其入队，直到其他线程给它发送释放信号。
      *
      * <p>The default implementation throws {@link
      * UnsupportedOperationException}.
@@ -1467,11 +1498,15 @@ public abstract class AbstractQueuedSynchronizer
     }
 
     /**
+     * ======================AQS.shared.acquire====================>
      * Acquires in shared mode, ignoring interrupts.  Implemented by
      * first invoking at least once {@link #tryAcquireShared},
      * returning on success.  Otherwise the thread is queued, possibly
      * repeatedly blocking and unblocking, invoking {@link
      * #tryAcquireShared} until success.
+     * 以共享模式请求资源，并忽略中断。
+     * 实现方式为调用 tryAcquireShared 至少一次，并在成功时返回。
+     * 否则线程将入队，并可能在挂起和唤醒间无限循环，直到成功调用tryAcquireShared。
      *
      * @param arg the acquire argument.  This value is conveyed to
      *        {@link #tryAcquireShared} but is otherwise uninterpreted
@@ -1528,8 +1563,11 @@ public abstract class AbstractQueuedSynchronizer
     }
 
     /**
+     * ===================AQS.shared.release====================>
      * Releases in shared mode.  Implemented by unblocking one or more
      * threads if {@link #tryReleaseShared} returns true.
+     * 以共享模式释放资源。
+     * 具体实现为如果tryReleaseShared返回true，唤醒一个或多个线程。
      *
      * @param arg the release argument.  This value is conveyed to
      *        {@link #tryReleaseShared} but is otherwise uninterpreted
