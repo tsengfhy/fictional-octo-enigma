@@ -257,8 +257,19 @@ public class ReentrantReadWriteLock
          * Lock state is logically divided into two unsigned shorts:
          * The lower one representing the exclusive (writer) lock hold count,
          * and the upper the shared (reader) hold count.
+         * 抽取读锁与写锁计数的常量与方法
+         * 锁状态逻辑上地分为两部分：
+         * 低位指代独占写锁计数，高位指代共享读锁计数
          */
 
+        /*
+         * int 32 位
+         * 偏移量 16 位， 高 16 位为读锁计数，低 16 位为写锁计数
+         * e.g.:
+         * state = 2 ^ 16 + 2
+         * sharedCount : (2 ^ 16 + 2) >> 16 = 1
+         * exclusiveCount : (2 ^ 16 + 2) & (2 ^ 16 -1) = (1 000……10)（二） & （0 111……11）（二）= 2
+         */
         static final int SHARED_SHIFT   = 16;
         static final int SHARED_UNIT    = (1 << SHARED_SHIFT);
         static final int MAX_COUNT      = (1 << SHARED_SHIFT) - 1;
@@ -374,6 +385,8 @@ public class ReentrantReadWriteLock
             if (free)
                 setExclusiveOwnerThread(null);
             setState(nextc);
+            // 若锁降级后，此处返回false，不会唤醒队列节点
+            // 但若同步队列中为读锁，则可唤醒，但实现功能复杂度略大
             return free;
         }
 
@@ -388,12 +401,17 @@ public class ReentrantReadWriteLock
              *    it is either a reentrant acquire or
              *    queue policy allows it. If so, update state
              *    and set owner.
+             * 流程：
+             * 1. 如果读锁非0或者写锁非零且非重入，返回false
+             * 2. 如果超过最大写锁计数，返回失败
+             * 3. 其他，如果线程是重入请求或者队列策略允许，那么可以获得锁。如此，更新状态并设置独占线程。
              */
             Thread current = Thread.currentThread();
             int c = getState();
             int w = exclusiveCount(c);
             if (c != 0) {
                 // (Note: if c != 0 and w == 0 then shared count != 0)
+                // 如果存在读锁，或不是当前线程持有写锁，不可获取锁
                 if (w == 0 || current != getExclusiveOwnerThread())
                     return false;
                 if (w + exclusiveCount(acquires) > MAX_COUNT)
@@ -429,6 +447,7 @@ public class ReentrantReadWriteLock
                 }
                 --rh.count;
             }
+            // 因读锁可多线程同时释放，自旋以保证成功
             for (;;) {
                 int c = getState();
                 int nextc = c - SHARED_UNIT;
@@ -436,6 +455,11 @@ public class ReentrantReadWriteLock
                     // Releasing the read lock has no effect on readers,
                     // but it may allow waiting writers to proceed if
                     // both read and write locks are now free.
+                    // 释放读锁对准备获取读锁的线程没有影响，
+                    // 但只有读写锁都归零，才允许唤醒等待写锁的线程
+                    // ※※※※※
+                    // 理想状况下读锁并发数 Integer.MAX_VALUE / 2, 等待队列中的均为获取写锁的
+                    // 所以读写锁都归零才唤醒队列节点
                     return nextc == 0;
             }
         }
@@ -460,9 +484,16 @@ public class ReentrantReadWriteLock
              * 3. If step 2 fails either because thread
              *    apparently not eligible or CAS fails or count
              *    saturated, chain to version with full retry loop.
+             * 流程：
+             * 1. 如果由其他线程持有写锁，请求失败
+             * 2. 其他，如果队列策略允许，线程可以获取锁。通过CAS保证状态的更新。
+             *    需要注意，此处没有在公平锁下执行重入检查，而是延迟到自旋版本以避免在非自旋情况下的复杂情况。
+             * 3. 如果步骤二因公平条件或CAS失败，将进入自旋版本。
              */
             Thread current = Thread.currentThread();
             int c = getState();
+            // 若存在写锁且不是当前线程持有，返回-1，即失败
+            // 支持锁降级
             if (exclusiveCount(c) != 0 &&
                 getExclusiveOwnerThread() != current)
                 return -1;
@@ -520,6 +551,7 @@ public class ReentrantReadWriteLock
                                     readHolds.remove();
                             }
                         }
+                        // 若公平锁，且非重入，返回false，然后入队
                         if (rh.count == 0)
                             return -1;
                     }
