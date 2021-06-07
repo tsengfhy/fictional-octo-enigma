@@ -83,8 +83,10 @@ public class LongAdder extends Striped64 implements Serializable {
      */
     public void add(long x) {
         Cell[] as; long b, v; int m; Cell a;
+        // 已出现竞争，或竞争失败，启用表格，从此base的CAS只用于后备方案
         if ((as = cells) != null || !casBase(b = base, b + x)) {
             boolean uncontended = true;
+            // 短路径失败，进入完整方法（可能尚未初始化或插槽竞争失败）
             if (as == null || (m = as.length - 1) < 0 ||
                 (a = as[getProbe() & m]) == null ||
                 !(uncontended = a.cas(v = a.value, v + x)))
@@ -120,6 +122,7 @@ public class LongAdder extends Striped64 implements Serializable {
         long sum = base;
         if (as != null) {
             for (int i = 0; i < as.length; ++i) {
+                // 可能扩容后，某个插槽却从未使用
                 if ((a = as[i]) != null)
                     sum += a.value;
             }
